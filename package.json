@@ -1,0 +1,10 @@
+{
+  "name": "video-compress-worker",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/s3-request-presigner": "^3.0.0",
+    "get-video-duration": "^4.1.0",
+    "typescript": "^5.0.0"
+  }
+}

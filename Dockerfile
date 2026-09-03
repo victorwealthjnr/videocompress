@@ -3,5 +3,5 @@ RUN apt-get update && apt-get install -y ffmpeg
 WORKDIR /app
 COPY . .
 RUN npm install
-RUN npx tsc compress-worker.ts
+RUN npx tsc
 CMD ["node", "compress-worker.js"]

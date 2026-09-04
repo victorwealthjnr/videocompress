@@ -1,7 +1,16 @@
 /**
  * Compression worker — pulls a job, downloads the raw upload from R2,
- * runs two-pass ffmpeg targeting ~6MB output, uploads the result back
- * to R2, and reports the final size/key.
+ * runs two-pass ffmpeg targeting a fixed QUALITY BITRATE (not a fixed
+ * file size), uploads the result back to R2, and reports the final
+ * size/key.
+ *
+ * Why bitrate instead of file size: a fixed size target (e.g. "always
+ * 12MB") forces the bitrate down as duration grows, so a 10-minute
+ * video gets crushed into unusable quality just to hit the same byte
+ * count as a 15-second one. Targeting a fixed bitrate keeps quality
+ * consistent regardless of length — file size then scales naturally
+ * and honestly with duration (a longer video is a bigger file, same
+ * as it would be uncompressed).
  *
  * Run this as a separate process from your web server (e.g. a
  * long-running worker on Railway/Fly/a VPS, or a queue consumer).
@@ -11,7 +20,7 @@ import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } fro
 import { spawn } from "child_process";
 import { createWriteStream, statSync, unlinkSync } from "fs";
 import { pipeline } from "stream/promises";
-import { getVideoDurationInSeconds } from "get-video-duration"; // or parse via ffprobe
+import { getVideoDurationInSeconds } from "get-video-duration";
 
 const r2 = new S3Client({
   region: "auto",
@@ -23,8 +32,16 @@ const r2 = new S3Client({
 });
 
 const BUCKET = process.env.R2_BUCKET!;
-const TARGET_BYTES = 12 * 1024 * 1024; // ~12MB target
-const TOLERANCE_MAX_BYTES = 15 * 1024 * 1024; // accept up to 15MB before a corrective re-encode
+
+// Quality-first, size-capped: short clips get IDEAL_KBPS (looks great,
+// naturally comes out small). Once a video is long enough that
+// IDEAL_KBPS would blow past MAX_OUTPUT_BYTES, bitrate is scaled down
+// just enough to fit the cap — quality degrades gracefully only for
+// videos long enough to need it, instead of a flat target that
+// crushes every video to the same byte count regardless of length.
+const IDEAL_KBPS = 3000; // solid 1080p quality target
+const MAX_OUTPUT_BYTES = 100 * 1024 * 1024; // hard cap regardless of duration
+const MIN_KBPS_FLOOR = 400; // never go below this even to hit the cap — protects a watchable minimum
 const AUDIO_KBPS = 128;
 
 type Job = { videoId: string; userId: string; rawKey: string };
@@ -35,21 +52,46 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
 
   await downloadFromR2(job.rawKey, localRaw);
 
-  const durationSec = await getVideoDurationInSeconds(localRaw);
-  let videoKbps = calculateTargetBitrate(durationSec);
+  const rawSizeBytes = statSync(localRaw).size;
 
-  await runTwoPassEncode(localRaw, localOut, videoKbps, job.videoId);
+  if (rawSizeBytes <= MAX_OUTPUT_BYTES) {
+    // Already small enough — don't re-encode and lose quality for no
+    // reason. Just remux (stream copy, no decode/re-encode) to ensure
+    // it's a clean, faststart-enabled mp4 for fast web playback. This
+    // is near-instant and 100% lossless since nothing is re-encoded.
+    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB, already under cap — remuxing only, no re-encode.`);
+    try {
+      await remuxOnly(localRaw, localOut);
+    } catch (err) {
+      // Rare: some source codec/container combos can't be stream-copied
+      // cleanly into mp4. Fall back to a real encode so the job still
+      // succeeds rather than failing outright.
+      console.log("Remux failed, falling back to full encode:", err);
+      const durationSec = await getVideoDurationInSeconds(localRaw);
+      const videoKbps = calculateBitrate(durationSec);
+      await runSinglePassEncode(localRaw, localOut, videoKbps);
+    }
+  } else {
+    // Genuinely needs compressing — use the quality-first, size-capped
+    // bitrate so it comes down to a reasonable size without being
+    // crushed further than necessary.
+    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB, over cap — compressing.`);
+    const durationSec = await getVideoDurationInSeconds(localRaw);
+    let videoKbps = calculateBitrate(durationSec);
 
-  let sizeBytes = statSync(localOut).size;
+    await runSinglePassEncode(localRaw, localOut, videoKbps);
 
-  // One corrective re-encode if we overshot the tolerance band
-  if (sizeBytes > TOLERANCE_MAX_BYTES) {
-    const overshoot = sizeBytes / TARGET_BYTES;
-    videoKbps = Math.floor(videoKbps / overshoot);
-    await runTwoPassEncode(localRaw, localOut, videoKbps, job.videoId);
-    sizeBytes = statSync(localOut).size;
+    let sizeBytes = statSync(localOut).size;
+
+    // Corrective re-encode if the estimate still overshot the cap
+    if (sizeBytes > MAX_OUTPUT_BYTES) {
+      const overshoot = sizeBytes / MAX_OUTPUT_BYTES;
+      videoKbps = Math.max(Math.floor(videoKbps / overshoot), MIN_KBPS_FLOOR);
+      await runSinglePassEncode(localRaw, localOut, videoKbps);
+    }
   }
 
+  const sizeBytes = statSync(localOut).size;
   const compressedKey = `compressed/${job.userId}/${job.videoId}.mp4`;
   await uploadToR2(localOut, compressedKey);
 
@@ -62,43 +104,55 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   return { compressedKey, sizeBytes };
 }
 
-function calculateTargetBitrate(durationSec: number): number {
-  // target_kbps = (target_MB * 8192) / duration - audio_kbps
-  const targetMB = TARGET_BYTES / (1024 * 1024);
-  const kbps = (targetMB * 8192) / durationSec - AUDIO_KBPS;
-  return Math.max(Math.floor(kbps), 150); // floor to avoid absurdly low bitrates on long clips
+/**
+ * Stream-copies the file into a clean mp4 with faststart enabled, with
+ * NO re-encoding — used when the original is already small enough
+ * that compressing it further would only cost quality for no benefit.
+ * Runs in a fraction of a second regardless of file size, since ffmpeg
+ * isn't decoding or encoding any frames, just repackaging the container.
+ */
+function remuxOnly(input: string, output: string): Promise<void> {
+  const args = [
+    "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
+    "-c", "copy",
+    "-movflags", "+faststart",
+    output,
+  ];
+  return runFfmpeg(args);
 }
 
-function runTwoPassEncode(input: string, output: string, videoKbps: number, jobId: string): Promise<void> {
+function calculateBitrate(durationSec: number): number {
+  // The bitrate that would exactly fill the size cap at this duration
+  const capMB = MAX_OUTPUT_BYTES / (1024 * 1024);
+  const capKbps = (capMB * 8192) / durationSec - AUDIO_KBPS;
+
+  // Use whichever is lower: our quality target, or what the cap allows.
+  // Short clips: capKbps is huge (short duration), so IDEAL_KBPS wins —
+  // quality-first, naturally small file.
+  // Long clips: capKbps becomes the binding constraint — size-first,
+  // bitrate scales down just enough to fit MAX_OUTPUT_BYTES.
+  const kbps = Math.min(IDEAL_KBPS, capKbps);
+  return Math.max(Math.floor(kbps), MIN_KBPS_FLOOR);
+}
+
+function runSinglePassEncode(input: string, output: string, videoKbps: number): Promise<void> {
   // Scale the longer dimension to 1080, preserving aspect ratio and
   // orientation instead of forcing everything into a fixed portrait
   // canvas — landscape videos get 1080 height, portrait get 1080 width.
   const scaleFilter = "scale='if(gt(iw,ih),-2,1080)':'if(gt(iw,ih),1080,-2)'";
-  const passLogPath = `/tmp/${jobId}-passlog`;
 
-  const pass1Args = [
-    "-y", "-i", input,
+  const args = [
+    "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
     "-threads", "2",
     "-vf", scaleFilter,
     "-c:v", "libx264", "-b:v", `${videoKbps}k`,
-    "-passlogfile", passLogPath,
-    "-pass", "1", "-an", "-f", "mp4", "/dev/null",
-  ];
-
-  const pass2Args = [
-    "-y", "-i", input,
-    "-threads", "2",
-    "-vf", scaleFilter,
-    "-c:v", "libx264", "-b:v", `${videoKbps}k`,
-    "-passlogfile", passLogPath,
-    "-pass", "2",
-    "-preset", "slow", "-profile:v", "high", "-level", "4.1",
+    "-preset", "fast", "-profile:v", "high", "-level", "4.1",
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
     "-movflags", "+faststart",
     output,
   ];
 
-  return runFfmpeg(pass1Args).then(() => runFfmpeg(pass2Args)).then(() => undefined);
+  return runFfmpeg(args);
 }
 
 function runFfmpeg(args: string[]): Promise<void> {

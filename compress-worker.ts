@@ -95,6 +95,7 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
     unlinkSync(localRaw);
     unlinkSync(localOut);
     await r2.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: job.rawKey }));
+    await notifyAppOfCompletion(job.videoId, "rejected", { moderationFlag: moderationResult.reason });
     throw new Error(`Content moderation rejected video: ${moderationResult.reason}`);
   }
 
@@ -337,25 +338,49 @@ export async function getPresignedUploadUrl(userId: string, videoId: string): Pr
  */
 
 /**
- * Notifies your app's API once a video is done compressing, so it can
- * update the DB row and flip the UI status to "encoded". Builds a
- * permanent public URL (requires R2 public access enabled — see
- * bucket Settings → Public Access in Cloudflare) rather than a
- * presigned URL, since embeds need a link that never expires.
+ * Notifies your app's API when a video is done — either successfully
+ * encoded, or rejected by moderation. Builds a permanent public URL
+ * (requires R2 public access enabled — see bucket Settings → Public
+ * Access in Cloudflare) rather than a presigned URL, since embeds
+ * need a link that never expires.
  */
-async function notifyAppOfCompletion(videoId: string, compressedKey: string) {
-  const publicBase = process.env.R2_PUBLIC_URL;
-  if (!publicBase || !process.env.APP_URL) {
-    console.log("R2_PUBLIC_URL or APP_URL not set — skipping app notification (fine for manual testing).");
+async function notifyAppOfCompletion(
+  videoId: string,
+  status: "encoded" | "rejected",
+  options: { compressedKey?: string; sizeBytes?: number; moderationFlag?: string } = {}
+) {
+  if (!process.env.APP_URL) {
+    console.log("APP_URL not set — skipping app notification (fine for manual testing).");
     return;
   }
-  const compressedUrl = `${publicBase}/${compressedKey}`;
 
-  await fetch(`${process.env.APP_URL}/api/video-status`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ videoId, status: "encoded", compressedUrl }),
-  });
+  const body: Record<string, unknown> = { videoId, status };
+
+  if (status === "encoded" && options.compressedKey) {
+    const publicBase = process.env.R2_PUBLIC_URL;
+    body.compressedKey = options.compressedKey;
+    body.compressedUrl = publicBase ? `${publicBase}/${options.compressedKey}` : undefined;
+    body.sizeBytes = options.sizeBytes;
+  }
+
+  if (status === "rejected") {
+    body.moderationFlag = options.moderationFlag;
+  }
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (process.env.WORKER_CALLBACK_SECRET) {
+    headers["x-worker-secret"] = process.env.WORKER_CALLBACK_SECRET;
+  }
+
+  try {
+    await fetch(`${process.env.APP_URL}/api/video-status`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    console.error(`Failed to notify app of ${status} status for ${videoId}:`, err);
+  }
 }
 
 async function startBullMqWorker() {
@@ -368,7 +393,10 @@ async function startBullMqWorker() {
       console.log(`Picked up job ${job.id}:`, job.data);
       const result = await processJob(job.data as Job);
       console.log(`Job ${job.id} done. Compressed key: ${result.compressedKey}, size: ${(result.sizeBytes / 1024 / 1024).toFixed(2)}MB`);
-      await notifyAppOfCompletion((job.data as Job).videoId, result.compressedKey);
+      await notifyAppOfCompletion((job.data as Job).videoId, "encoded", {
+        compressedKey: result.compressedKey,
+        sizeBytes: result.sizeBytes,
+      });
       return result;
     },
     { connection, concurrency: 1 } // keep at 1 until memory headroom is confirmed on larger files

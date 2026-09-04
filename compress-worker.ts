@@ -27,7 +27,7 @@ const TARGET_BYTES = 6 * 1024 * 1024; // 6MB
 const TOLERANCE_MAX_BYTES = 7.13 * 1024 * 1024; // matches existing acceptance band
 const AUDIO_KBPS = 128;
 
-type Job = { videoId: string; rawKey: string };
+type Job = { videoId: string; userId: string; rawKey: string };
 
 export async function processJob(job: Job): Promise<{ compressedKey: string; sizeBytes: number }> {
   const localRaw = `/tmp/${job.videoId}-raw.mp4`;
@@ -38,7 +38,7 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   const durationSec = await getVideoDurationInSeconds(localRaw);
   let videoKbps = calculateTargetBitrate(durationSec);
 
-  await runTwoPassEncode(localRaw, localOut, videoKbps);
+  await runTwoPassEncode(localRaw, localOut, videoKbps, job.videoId);
 
   let sizeBytes = statSync(localOut).size;
 
@@ -46,11 +46,11 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   if (sizeBytes > TOLERANCE_MAX_BYTES) {
     const overshoot = sizeBytes / TARGET_BYTES;
     videoKbps = Math.floor(videoKbps / overshoot);
-    await runTwoPassEncode(localRaw, localOut, videoKbps);
+    await runTwoPassEncode(localRaw, localOut, videoKbps, job.videoId);
     sizeBytes = statSync(localOut).size;
   }
 
-  const compressedKey = `compressed/${job.videoId}.mp4`;
+  const compressedKey = `compressed/${job.userId}/${job.videoId}.mp4`;
   await uploadToR2(localOut, compressedKey);
 
   // Delete the large raw original from R2 now that we have the compressed version
@@ -69,24 +69,30 @@ function calculateTargetBitrate(durationSec: number): number {
   return Math.max(Math.floor(kbps), 150); // floor to avoid absurdly low bitrates on long clips
 }
 
-function runTwoPassEncode(input: string, output: string, videoKbps: number): Promise<void> {
+function runTwoPassEncode(input: string, output: string, videoKbps: number, jobId: string): Promise<void> {
   const scaleFilter =
     "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2";
+  const passLogPath = `/tmp/${jobId}-passlog`;
 
   const pass1Args = [
     "-y", "-i", input,
+    "-threads", "2",
     "-vf", scaleFilter,
     "-c:v", "libx264", "-b:v", `${videoKbps}k`,
+    "-passlogfile", passLogPath,
     "-pass", "1", "-an", "-f", "mp4", "/dev/null",
   ];
 
   const pass2Args = [
     "-y", "-i", input,
+    "-threads", "2",
     "-vf", scaleFilter,
     "-c:v", "libx264", "-b:v", `${videoKbps}k`,
+    "-passlogfile", passLogPath,
     "-pass", "2",
     "-preset", "slow", "-profile:v", "high", "-level", "4.1",
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
+    "-movflags", "+faststart",
     output,
   ];
 
@@ -127,63 +133,121 @@ async function uploadToR2(localPath: string, key: string): Promise<void> {
  * user starts an upload, so the raw 200MB file goes straight to R2
  * without touching your server.
  */
-export async function getPresignedUploadUrl(videoId: string): Promise<string> {
+export async function getPresignedUploadUrl(userId: string, videoId: string): Promise<string> {
   const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
-  const command = new PutObjectCommand({ Bucket: BUCKET, Key: `raw/${videoId}.mp4` });
+  const command = new PutObjectCommand({ Bucket: BUCKET, Key: `raw/${userId}/${videoId}.mp4` });
   return getSignedUrl(r2, command, { expiresIn: 3600 });
 }
 
 /**
- * MANUAL TEST MODE — no Redis/queue needed yet.
+ * REAL QUEUE CONSUMER — listens on the "video-compression" BullMQ
+ * queue and runs processJob() for every incoming job. Your API adds
+ * jobs to this same queue (name must match exactly) after confirming
+ * an upload to R2 is complete, e.g.:
  *
- * Two ways to trigger a test:
- *   A) TEST_RAW_KEY — an object already sitting in your R2 bucket
- *      (e.g. you uploaded a 200MB file via the Cloudflare dashboard
- *      to raw/my-test.mp4). This is the way to go for large files —
- *      skips baking anything into the Docker image entirely.
- *   B) TEST_LOCAL_FILE — a small file baked into the image via COPY
- *      in the Dockerfile (fine for quick small-file smoke tests only).
+ *   import { Queue } from "bullmq";
+ *   const queue = new Queue("video-compression", { connection: { url: process.env.REDIS_URL } });
+ *   await queue.add("compress", { videoId, userId, rawKey });
  *
- * Either way it will:
- *   1. Get the file into R2 under raw/ (skipped if using TEST_RAW_KEY,
- *      since it's already there)
- *   2. Run processJob() on it (download, two-pass encode, upload)
- *   3. Delete the raw original from R2
- *   4. Log the final compressed key + size
+ * This worker process just needs to stay running — Railway keeps it
+ * alive as a long-running service.
  *
- * Once this works end-to-end, swap this block out for a real BullMQ
- * consumer that calls processJob() per incoming job instead.
+ * If REDIS_URL isn't set yet (Redis not wired up), falls back to the
+ * manual TEST_RAW_KEY test mode instead — so you can still test the
+ * compression pipeline itself before adding the queue.
+ */
+
+/**
+ * Notifies your app's API once a video is done compressing, so it can
+ * update the DB row and flip the UI status to "encoded". Builds a
+ * permanent public URL (requires R2 public access enabled — see
+ * bucket Settings → Public Access in Cloudflare) rather than a
+ * presigned URL, since embeds need a link that never expires.
+ */
+async function notifyAppOfCompletion(videoId: string, compressedKey: string) {
+  const publicBase = process.env.R2_PUBLIC_URL;
+  if (!publicBase || !process.env.APP_URL) {
+    console.log("R2_PUBLIC_URL or APP_URL not set — skipping app notification (fine for manual testing).");
+    return;
+  }
+  const compressedUrl = `${publicBase}/${compressedKey}`;
+
+  await fetch(`${process.env.APP_URL}/api/video-status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ videoId, status: "encoded", compressedUrl }),
+  });
+}
+
+async function startBullMqWorker() {
+  const { Worker } = await import("bullmq");
+  const connection = { url: process.env.REDIS_URL! };
+
+  const worker = new Worker(
+    "video-compression",
+    async (job) => {
+      console.log(`Picked up job ${job.id}:`, job.data);
+      const result = await processJob(job.data as Job);
+      console.log(`Job ${job.id} done. Compressed key: ${result.compressedKey}, size: ${(result.sizeBytes / 1024 / 1024).toFixed(2)}MB`);
+      await notifyAppOfCompletion((job.data as Job).videoId, result.compressedKey);
+      return result;
+    },
+    { connection, concurrency: 1 } // keep at 1 until memory headroom is confirmed on larger files
+  );
+
+  worker.on("failed", (job, err) => {
+    console.error(`Job ${job?.id} failed:`, err.message);
+  });
+
+  worker.on("ready", () => {
+    console.log("Worker connected to Redis, listening for jobs on 'video-compression' queue...");
+  });
+}
+
+/**
+ * MANUAL TEST MODE — used when REDIS_URL isn't set yet. Runs one job
+ * against TEST_RAW_KEY (an object already in R2) or TEST_LOCAL_FILE,
+ * logs the result, and then goes idle. Does NOT call process.exit() on
+ * failure, so Railway won't crash-loop it — the container just stays
+ * up so you can read the error in the logs at your own pace.
  */
 async function runManualTest() {
   const testRawKey = process.env.TEST_RAW_KEY;
   const testFilePath = process.env.TEST_LOCAL_FILE;
 
   if (!testRawKey && !testFilePath) {
-    console.log("Worker deployed. Set TEST_RAW_KEY (R2 object key) or TEST_LOCAL_FILE to run a manual test.");
-    setInterval(() => console.log("Worker alive, idle (no queue connected yet)."), 60_000);
+    console.log("No REDIS_URL, TEST_RAW_KEY, or TEST_LOCAL_FILE set. Idling.");
+    setInterval(() => console.log("Worker alive, idle."), 60_000);
     return;
   }
 
   const videoId = `test-${Date.now()}`;
+  const userId = "test-user";
   let rawKey: string;
 
-  if (testRawKey) {
-    console.log(`Using existing R2 object: ${testRawKey}`);
-    rawKey = testRawKey;
-  } else {
-    rawKey = `raw/${videoId}.mp4`;
-    console.log(`Uploading ${testFilePath} to R2 as ${rawKey}...`);
-    await uploadToR2(testFilePath!, rawKey);
+  try {
+    if (testRawKey) {
+      console.log(`Using existing R2 object: ${testRawKey}`);
+      rawKey = testRawKey;
+    } else {
+      rawKey = `raw/${userId}/${videoId}.mp4`;
+      console.log(`Uploading ${testFilePath} to R2 as ${rawKey}...`);
+      await uploadToR2(testFilePath!, rawKey);
+    }
+
+    console.log("Running compression job...");
+    const result = await processJob({ videoId, userId, rawKey });
+    console.log(`Done. Compressed key: ${result.compressedKey}, size: ${(result.sizeBytes / 1024 / 1024).toFixed(2)}MB`);
+  } catch (err) {
+    console.error("Manual test failed:", err);
   }
 
-  console.log("Running compression job...");
-  const result = await processJob({ videoId, rawKey });
-
-  console.log(`Done. Compressed key: ${result.compressedKey}, size: ${(result.sizeBytes / 1024 / 1024).toFixed(2)}MB`);
-  console.log("Raw original deleted from R2. Check your bucket to confirm.");
+  console.log("Manual test finished (success or failure above). Idling — no auto-restart loop.");
+  setInterval(() => {}, 1 << 30); // keep process alive without spamming logs
 }
 
-runManualTest().catch((err) => {
-  console.error("Manual test failed:", err);
-  process.exit(1);
-});
+if (process.env.REDIS_URL) {
+  startBullMqWorker();
+} else {
+  runManualTest();
+}

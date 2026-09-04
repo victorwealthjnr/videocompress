@@ -1,16 +1,16 @@
 /**
  * Compression worker — pulls a job, downloads the raw upload from R2,
- * runs two-pass ffmpeg targeting a fixed QUALITY BITRATE (not a fixed
- * file size), uploads the result back to R2, and reports the final
+ * runs CRF-based ffmpeg encoding (quality-driven, not a fixed
+ * bitrate), uploads the result back to R2, and reports the final
  * size/key.
  *
- * Why bitrate instead of file size: a fixed size target (e.g. "always
- * 12MB") forces the bitrate down as duration grows, so a 10-minute
- * video gets crushed into unusable quality just to hit the same byte
- * count as a 15-second one. Targeting a fixed bitrate keeps quality
- * consistent regardless of length — file size then scales naturally
- * and honestly with duration (a longer video is a bigger file, same
- * as it would be uncompressed).
+ * Why CRF instead of a fixed bitrate: a fixed bitrate spends the same
+ * bits/second on every video regardless of content — wasteful on a
+ * simple talking-head clip, insufficient on a busy/detailed one. CRF
+ * lets the encoder decide bits-per-frame based on actual visual
+ * complexity, so simple content compresses efficiently and complex
+ * content gets more bits automatically. File size becomes a natural
+ * byproduct of content and duration, not a forced target.
  *
  * Run this as a separate process from your web server (e.g. a
  * long-running worker on Railway/Fly/a VPS, or a queue consumer).
@@ -20,7 +20,6 @@ import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } fro
 import { spawn } from "child_process";
 import { createWriteStream, statSync, unlinkSync } from "fs";
 import { pipeline } from "stream/promises";
-import { getVideoDurationInSeconds } from "get-video-duration";
 
 const r2 = new S3Client({
   region: "auto",
@@ -33,16 +32,15 @@ const r2 = new S3Client({
 
 const BUCKET = process.env.R2_BUCKET!;
 
-// Quality-first, size-capped: short clips get IDEAL_KBPS (looks great,
-// naturally comes out small). Once a video is long enough that
-// IDEAL_KBPS would blow past MAX_OUTPUT_BYTES, bitrate is scaled down
-// just enough to fit the cap — quality degrades gracefully only for
-// videos long enough to need it, instead of a flat target that
-// crushes every video to the same byte count regardless of length.
-const IDEAL_KBPS = 3000; // solid 1080p quality target
-const MAX_OUTPUT_BYTES = 100 * 1024 * 1024; // hard cap regardless of duration
-const MIN_KBPS_FLOOR = 400; // never go below this even to hit the cap — protects a watchable minimum
-const AUDIO_KBPS = 128;
+// CRF 23 is a well-established "very good visual quality" target for
+// x264 — lower = better quality/bigger file, higher = smaller/worse.
+// 100MB is a safety cap only — CRF rarely needs it for normal clips,
+// but protects against pathological cases (very long or very complex
+// footage) producing an unreasonably large file.
+const DEFAULT_CRF = 23;
+const FALLBACK_CRF = 26; // used only if DEFAULT_CRF somehow overshoots the cap
+const MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
+const AUDIO_KBPS = 96;
 
 type Job = { videoId: string; userId: string; rawKey: string };
 
@@ -67,27 +65,22 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
       // cleanly into mp4. Fall back to a real encode so the job still
       // succeeds rather than failing outright.
       console.log("Remux failed, falling back to full encode:", err);
-      const durationSec = await getVideoDurationInSeconds(localRaw);
-      const videoKbps = calculateBitrate(durationSec);
-      await runSinglePassEncode(localRaw, localOut, videoKbps);
+      await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF);
     }
   } else {
-    // Genuinely needs compressing — use the quality-first, size-capped
-    // bitrate so it comes down to a reasonable size without being
-    // crushed further than necessary.
+    // Genuinely needs compressing — CRF lets the encoder decide bits
+    // based on actual content complexity rather than a flat target.
     console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB, over cap — compressing.`);
-    const durationSec = await getVideoDurationInSeconds(localRaw);
-    let videoKbps = calculateBitrate(durationSec);
-
-    await runSinglePassEncode(localRaw, localOut, videoKbps);
+    await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF);
 
     let sizeBytes = statSync(localOut).size;
 
-    // Corrective re-encode if the estimate still overshot the cap
+    // If a genuinely long/complex video still overshoots the cap, one
+    // corrective pass at a slightly higher CRF (a bit more compression,
+    // not a crushing amount) rather than trying to hit an exact size.
     if (sizeBytes > MAX_OUTPUT_BYTES) {
-      const overshoot = sizeBytes / MAX_OUTPUT_BYTES;
-      videoKbps = Math.max(Math.floor(videoKbps / overshoot), MIN_KBPS_FLOOR);
-      await runSinglePassEncode(localRaw, localOut, videoKbps);
+      console.log("Output exceeded cap — increasing compression slightly.");
+      await runSinglePassEncode(localRaw, localOut, FALLBACK_CRF);
     }
   }
 
@@ -121,21 +114,7 @@ function remuxOnly(input: string, output: string): Promise<void> {
   return runFfmpeg(args);
 }
 
-function calculateBitrate(durationSec: number): number {
-  // The bitrate that would exactly fill the size cap at this duration
-  const capMB = MAX_OUTPUT_BYTES / (1024 * 1024);
-  const capKbps = (capMB * 8192) / durationSec - AUDIO_KBPS;
-
-  // Use whichever is lower: our quality target, or what the cap allows.
-  // Short clips: capKbps is huge (short duration), so IDEAL_KBPS wins —
-  // quality-first, naturally small file.
-  // Long clips: capKbps becomes the binding constraint — size-first,
-  // bitrate scales down just enough to fit MAX_OUTPUT_BYTES.
-  const kbps = Math.min(IDEAL_KBPS, capKbps);
-  return Math.max(Math.floor(kbps), MIN_KBPS_FLOOR);
-}
-
-function runSinglePassEncode(input: string, output: string, videoKbps: number): Promise<void> {
+function runSinglePassEncode(input: string, output: string, crf: number): Promise<void> {
   // Scale the longer dimension to 1080, preserving aspect ratio and
   // orientation instead of forcing everything into a fixed portrait
   // canvas — landscape videos get 1080 height, portrait get 1080 width.
@@ -145,7 +124,7 @@ function runSinglePassEncode(input: string, output: string, videoKbps: number): 
     "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
     "-threads", "2",
     "-vf", scaleFilter,
-    "-c:v", "libx264", "-b:v", `${videoKbps}k`,
+    "-c:v", "libx264", "-crf", `${crf}`,
     "-preset", "fast", "-profile:v", "high", "-level", "4.1",
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
     "-movflags", "+faststart",

@@ -23,8 +23,8 @@ const r2 = new S3Client({
 });
 
 const BUCKET = process.env.R2_BUCKET!;
-const TARGET_BYTES = 6 * 1024 * 1024; // 6MB
-const TOLERANCE_MAX_BYTES = 7.13 * 1024 * 1024; // matches existing acceptance band
+const TARGET_BYTES = 12 * 1024 * 1024; // ~12MB target
+const TOLERANCE_MAX_BYTES = 15 * 1024 * 1024; // accept up to 15MB before a corrective re-encode
 const AUDIO_KBPS = 128;
 
 type Job = { videoId: string; userId: string; rawKey: string };
@@ -70,8 +70,10 @@ function calculateTargetBitrate(durationSec: number): number {
 }
 
 function runTwoPassEncode(input: string, output: string, videoKbps: number, jobId: string): Promise<void> {
-  const scaleFilter =
-    "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2";
+  // Scale the longer dimension to 1080, preserving aspect ratio and
+  // orientation instead of forcing everything into a fixed portrait
+  // canvas — landscape videos get 1080 height, portrait get 1080 width.
+  const scaleFilter = "scale='if(gt(iw,ih),-2,1080)':'if(gt(iw,ih),1080,-2)'";
   const passLogPath = `/tmp/${jobId}-passlog`;
 
   const pass1Args = [

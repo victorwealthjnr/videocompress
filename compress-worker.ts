@@ -122,7 +122,6 @@ function remuxOnly(input: string, output: string): Promise<void> {
   const args = [
     "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
     "-c", "copy",
-    "-movflags", "+faststart",
     output,
   ];
   return runFfmpeg(args);
@@ -163,7 +162,6 @@ function runSinglePassEncode(input: string, output: string, crf: number, waterma
     "-c:v", "libx264", "-crf", `${crf}`,
     "-preset", "fast", "-profile:v", "high", "-level", "4.1",
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
-    "-movflags", "+faststart",
     output,
   );
 

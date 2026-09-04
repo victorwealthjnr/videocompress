@@ -164,7 +164,7 @@ function runSinglePassEncode(input: string, output: string, crf: number, waterma
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
     "-movflags", "+faststart",
     output,
-  ];
+  );
 
   return runFfmpeg(args);
 }

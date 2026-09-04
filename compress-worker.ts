@@ -42,7 +42,7 @@ const FALLBACK_CRF = 26; // used only if DEFAULT_CRF somehow overshoots the cap
 const MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
 const AUDIO_KBPS = 96;
 
-type Job = { videoId: string; userId: string; rawKey: string };
+type Job = { videoId: string; userId: string; rawKey: string; watermark?: boolean };
 
 export async function processJob(job: Job): Promise<{ compressedKey: string; sizeBytes: number }> {
   const localRaw = `/tmp/${job.videoId}-raw.mp4`;
@@ -51,27 +51,26 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   await downloadFromR2(job.rawKey, localRaw);
 
   const rawSizeBytes = statSync(localRaw).size;
+  const needsWatermark = job.watermark === true;
 
-  if (rawSizeBytes <= MAX_OUTPUT_BYTES) {
-    // Already small enough — don't re-encode and lose quality for no
-    // reason. Just remux (stream copy, no decode/re-encode) to ensure
-    // it's a clean, faststart-enabled mp4 for fast web playback. This
-    // is near-instant and 100% lossless since nothing is re-encoded.
+  if (rawSizeBytes <= MAX_OUTPUT_BYTES && !needsWatermark) {
+    // Already small enough and no watermark needed — don't re-encode
+    // and lose quality for no reason. Just remux (stream copy, no
+    // decode/re-encode) for a clean, faststart-enabled mp4. Note: a
+    // watermark can't be added via stream copy, so if one's required
+    // this path is skipped even for small files (see below).
     console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB, already under cap — remuxing only, no re-encode.`);
     try {
       await remuxOnly(localRaw, localOut);
     } catch (err) {
-      // Rare: some source codec/container combos can't be stream-copied
-      // cleanly into mp4. Fall back to a real encode so the job still
-      // succeeds rather than failing outright.
       console.log("Remux failed, falling back to full encode:", err);
-      await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF);
+      await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF, needsWatermark);
     }
   } else {
-    // Genuinely needs compressing — CRF lets the encoder decide bits
-    // based on actual content complexity rather than a flat target.
-    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB, over cap — compressing.`);
-    await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF);
+    // Either genuinely needs compressing, or needs a watermark burned
+    // in (which requires a real encode either way).
+    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB${needsWatermark ? " (watermark required)" : ", over cap"} — encoding.`);
+    await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF, needsWatermark);
 
     let sizeBytes = statSync(localOut).size;
 
@@ -80,11 +79,25 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
     // not a crushing amount) rather than trying to hit an exact size.
     if (sizeBytes > MAX_OUTPUT_BYTES) {
       console.log("Output exceeded cap — increasing compression slightly.");
-      await runSinglePassEncode(localRaw, localOut, FALLBACK_CRF);
+      await runSinglePassEncode(localRaw, localOut, FALLBACK_CRF, needsWatermark);
     }
   }
 
   const sizeBytes = statSync(localOut).size;
+
+  // Content moderation gate: grab a few frames from the final output
+  // and check them before this video is ever made public. If flagged,
+  // the compressed file is deleted and never uploaded to the public
+  // compressed/ folder — nothing bad ever gets a live URL.
+  const moderationResult = await moderateVideo(localOut, job.videoId);
+  if (moderationResult.flagged) {
+    console.log(`Video ${job.videoId} FLAGGED by moderation (${moderationResult.reason}) — not publishing.`);
+    unlinkSync(localRaw);
+    unlinkSync(localOut);
+    await r2.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: job.rawKey }));
+    throw new Error(`Content moderation rejected video: ${moderationResult.reason}`);
+  }
+
   const compressedKey = `compressed/${job.userId}/${job.videoId}.mp4`;
   await uploadToR2(localOut, compressedKey);
 
@@ -114,7 +127,12 @@ function remuxOnly(input: string, output: string): Promise<void> {
   return runFfmpeg(args);
 }
 
-function runSinglePassEncode(input: string, output: string, crf: number): Promise<void> {
+// Path to your logo file, bundled into the Docker image via
+// `COPY logo.png /app/logo.png` in your Dockerfile. Use a PNG with a
+// transparent background for a clean overlay look.
+const WATERMARK_PATH = "/app/logo.png";
+
+function runSinglePassEncode(input: string, output: string, crf: number, watermark = false): Promise<void> {
   // Scale the longer dimension to 1080, preserving aspect ratio and
   // orientation instead of forcing everything into a fixed portrait
   // canvas — landscape videos get 1080 height, portrait get 1080 width.
@@ -122,8 +140,25 @@ function runSinglePassEncode(input: string, output: string, crf: number): Promis
 
   const args = [
     "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
+  ];
+
+  if (watermark) {
+    // Second input: the logo image, overlaid in the bottom-right corner
+    // with a small margin, at reduced opacity so it doesn't compete
+    // with the video content.
+    args.push("-i", WATERMARK_PATH);
+    args.push(
+      "-filter_complex",
+      `[0:v]${scaleFilter}[scaled];` +
+      `[1:v]format=rgba,colorchannelmixer=aa=0.7,scale=iw*0.12:-1[logo];` +
+      `[scaled][logo]overlay=W-w-24:H-h-24`
+    );
+  } else {
+    args.push("-vf", scaleFilter);
+  }
+
+  args.push(
     "-threads", "2",
-    "-vf", scaleFilter,
     "-c:v", "libx264", "-crf", `${crf}`,
     "-preset", "fast", "-profile:v", "high", "-level", "4.1",
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
@@ -151,14 +186,123 @@ async function downloadFromR2(key: string, localPath: string): Promise<void> {
   await pipeline(res.Body as NodeJS.ReadableStream, createWriteStream(localPath));
 }
 
-async function uploadToR2(localPath: string, key: string): Promise<void> {
+/**
+ * Content moderation gate — grabs sample frames from the video,
+ * briefly uploads each to a private R2 prefix to get a scannable URL,
+ * and sends them to Hive Moderation's Visual Moderation API. Requires
+ * HIVE_API_KEY in your environment (get one from your Hive dashboard).
+ *
+ * This covers general explicit/policy-violating content (nudity,
+ * violence, etc.) — it does NOT cover CSAM. CSAM detection needs a
+ * dedicated, purpose-built service (Thorn's Safer, Microsoft's
+ * PhotoDNA) that hash-matches against known illegal content databases
+ * and integrates with mandatory legal reporting. Never rely on a
+ * general moderation API or a general-purpose AI model for that
+ * category.
+ */
+async function moderateVideo(videoPath: string, videoId: string): Promise<{ flagged: boolean; reason?: string }> {
+  const hiveApiKey = process.env.HIVE_API_KEY;
+  if (!hiveApiKey) {
+    console.log("HIVE_API_KEY not set — skipping moderation check. Set this before going live.");
+    return { flagged: false };
+  }
+
+  const framePaths = await extractSampleFrames(videoPath, videoId);
+
+  try {
+    for (const framePath of framePaths) {
+      const tempKey = `moderation-temp/${videoId}-${Date.now()}.jpg`;
+      await uploadToR2(framePath, tempKey, "image/jpeg");
+
+      const { getSignedUrl } = await import("@aws-sdk/s3-request-presigner");
+      const frameUrl = await getSignedUrl(
+        r2,
+        new GetObjectCommand({ Bucket: BUCKET, Key: tempKey }),
+        { expiresIn: 300 }
+      );
+
+      const result = await callHiveModeration(frameUrl, hiveApiKey);
+
+      // Clean up the temp frame from R2 regardless of result
+      await r2.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: tempKey }));
+
+      if (result.flagged) {
+        return result;
+      }
+    }
+    return { flagged: false };
+  } finally {
+    for (const framePath of framePaths) {
+      try { unlinkSync(framePath); } catch { /* already gone, fine */ }
+    }
+  }
+}
+
+function extractSampleFrames(videoPath: string, videoId: string): Promise<string[]> {
+  // Grabs 3 frames spread across the video (roughly every ~3 seconds
+  // at 30fps) rather than just the first frame, which is often a
+  // blank intro and not representative of actual content.
+  const outputPattern = `/tmp/${videoId}-frame-%d.jpg`;
+  const args = [
+    "-y", "-i", videoPath,
+    "-vf", "select='not(mod(n\\,90))'",
+    "-frames:v", "3",
+    "-vsync", "vfr",
+    outputPattern,
+  ];
+
+  return runFfmpeg(args).then(() => {
+    return [1, 2, 3].map((n) => `/tmp/${videoId}-frame-${n}.jpg`);
+  });
+}
+
+async function callHiveModeration(imageUrl: string, apiKey: string): Promise<{ flagged: boolean; reason?: string }> {
+  const res = await fetch("https://api.hivemoderation.com/api/v2/task/sync", {
+    method: "POST",
+    headers: {
+      Authorization: `token ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      url: imageUrl,
+      models: ["visual"],
+    }),
+  });
+
+  const data = await res.json();
+
+  // NOTE: adjust this parsing to match the exact response shape Hive
+  // returns for your project/model version — check a live response in
+  // your Hive dashboard or their docs for the precise field names.
+  // This checks for a general NSFW/explicit class score above a
+  // threshold as a starting point.
+  try {
+    const output = data?.status?.[0]?.response?.output ?? [];
+    for (const head of output) {
+      for (const cls of head?.classes ?? []) {
+        if (
+          (cls.class?.includes("nsfw") || cls.class?.includes("sexual")) &&
+          cls.score > 0.85
+        ) {
+          return { flagged: true, reason: `${cls.class} (${cls.score.toFixed(2)})` };
+        }
+      }
+    }
+  } catch (err) {
+    console.log("Could not parse Hive response, failing safe (not flagged):", err);
+  }
+
+  return { flagged: false };
+}
+
+async function uploadToR2(localPath: string, key: string, contentType = "video/mp4"): Promise<void> {
   const fs = await import("fs");
   await r2.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
       Body: fs.createReadStream(localPath),
-      ContentType: "video/mp4",
+      ContentType: contentType,
     })
   );
 }

@@ -384,6 +384,7 @@ async function notifyAppOfCompletion(
 }
 
 async function startBullMqWorker() {
+  console.log("Starting BullMQ worker, connecting to Redis...");
   const { Worker } = await import("bullmq");
   const connection = { url: process.env.REDIS_URL! };
 
@@ -404,6 +405,10 @@ async function startBullMqWorker() {
 
   worker.on("failed", (job, err) => {
     console.error(`Job ${job?.id} failed:`, err.message);
+  });
+
+  worker.on("error", (err) => {
+    console.error("BullMQ worker connection error:", err);
   });
 
   worker.on("ready", () => {

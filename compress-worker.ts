@@ -269,7 +269,7 @@ async function callHiveModeration(imageUrl: string, apiKey: string): Promise<{ f
     }),
   });
 
-  const data = await res.json();
+  const data = await res.json() as any;
 
   // NOTE: adjust this parsing to match the exact response shape Hive
   // returns for your project/model version — check a live response in

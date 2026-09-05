@@ -161,6 +161,7 @@ function runSinglePassEncode(input: string, output: string, crf: number, waterma
     "-threads", "2",
     "-c:v", "libx264", "-crf", `${crf}`,
     "-preset", "fast", "-profile:v", "high", "-level", "4.1",
+    "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", // keyframe every ~2s for smooth seeking
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
     output,
   );
@@ -302,6 +303,10 @@ async function uploadToR2(localPath: string, key: string, contentType = "video/m
       Key: key,
       Body: fs.createReadStream(localPath),
       ContentType: contentType,
+      // Compressed videos never change once created — safe to cache
+      // aggressively at Cloudflare's edge and in browsers, unlike a
+      // typical 4-hour cache window for content that might update.
+      CacheControl: contentType === "video/mp4" ? "public, max-age=31536000, immutable" : undefined,
     })
   );
 }

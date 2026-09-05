@@ -39,7 +39,7 @@ const BUCKET = process.env.R2_BUCKET!;
 // footage) producing an unreasonably large file.
 const DEFAULT_CRF = 23;
 const FALLBACK_CRF = 26; // used only if DEFAULT_CRF somehow overshoots the cap
-const MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
+const MAX_OUTPUT_BYTES = 240 * 1024 * 1024; // matches your actual 240MB upload cap — heavy CRF compression never triggers for a normal upload; it's a pure safety net for the edge case of something slipping past app-level validation
 const AUDIO_KBPS = 96;
 
 type Job = { videoId: string; userId: string; rawKey: string; watermark?: boolean };
@@ -53,24 +53,30 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   const rawSizeBytes = statSync(localRaw).size;
   const needsWatermark = job.watermark === true;
 
+  // PRIMARY OPERATION: fast remux to a clean, universally-playable MP4.
+  // This is what almost every upload needs — not size reduction, but
+  // compatibility. A phone/screen-recorder export might use a codec or
+  // container that doesn't play in every browser; remuxing (repackaging
+  // without re-encoding) fixes that in 1-3 seconds regardless of file
+  // size, with zero quality loss since no frame data is touched.
   if (rawSizeBytes <= MAX_OUTPUT_BYTES && !needsWatermark) {
-    // Already small enough and no watermark needed — don't re-encode
-    // and lose quality for no reason. Just remux (stream copy, no
-    // decode/re-encode) for a clean, faststart-enabled mp4. Note: a
-    // watermark can't be added via stream copy, so if one's required
-    // this path is skipped even for small files (see below).
-    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB, already under cap — remuxing only, no re-encode.`);
+    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB — fast remux for playback compatibility.`);
     try {
       await remuxOnly(localRaw, localOut);
     } catch (err) {
+      // Rare: some source codec/container combos can't be stream-copied
+      // cleanly into mp4. Fall back to a real encode so the job still
+      // succeeds rather than failing outright.
       console.log("Remux failed, falling back to full encode:", err);
-      await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF, needsWatermark);
+      await encodeWithFallback(localRaw, localOut, DEFAULT_CRF, needsWatermark);
     }
   } else {
-    // Either genuinely needs compressing, or needs a watermark burned
-    // in (which requires a real encode either way).
-    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB${needsWatermark ? " (watermark required)" : ", over cap"} — encoding.`);
-    await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF, needsWatermark);
+    // SECONDARY OPERATION, rare: only real files big enough to matter
+    // for someone's bandwidth cap (or a watermark request) go through
+    // the slower, heavier CRF compression path — not the default for
+    // most uploads.
+    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB${needsWatermark ? " (watermark required)" : ", over the compatibility threshold"} — running full compression.`);
+    await encodeWithFallback(localRaw, localOut, DEFAULT_CRF, needsWatermark);
 
     let sizeBytes = statSync(localOut).size;
 
@@ -79,7 +85,7 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
     // not a crushing amount) rather than trying to hit an exact size.
     if (sizeBytes > MAX_OUTPUT_BYTES) {
       console.log("Output exceeded cap — increasing compression slightly.");
-      await runSinglePassEncode(localRaw, localOut, FALLBACK_CRF, needsWatermark);
+      await encodeWithFallback(localRaw, localOut, FALLBACK_CRF, needsWatermark);
     }
   }
 
@@ -132,14 +138,36 @@ function remuxOnly(input: string, output: string): Promise<void> {
 // transparent background for a clean overlay look.
 const WATERMARK_PATH = "/app/logo.png";
 
-function runSinglePassEncode(input: string, output: string, crf: number, watermark = false): Promise<void> {
+/**
+ * Wraps the encode with one automatic retry using more error-tolerant
+ * input flags if the first attempt crashes. Some source files have
+ * malformed timestamps, corrupted frames, or unusual metadata that
+ * cause ffmpeg to die mid-decode (signal-killed, not a clean error).
+ * Rather than failing the whole job over a single quirky file, retry
+ * once with flags that tell ffmpeg to tolerate and skip past errors
+ * in the input instead of crashing on them.
+ */
+async function encodeWithFallback(input: string, output: string, crf: number, watermark: boolean): Promise<void> {
+  try {
+    await runSinglePassEncode(input, output, crf, watermark);
+  } catch (err) {
+    console.log("Primary encode failed, retrying with error-tolerant flags:", err);
+    await runSinglePassEncode(input, output, crf, watermark, /* lenient */ true);
+  }
+}
+
+function runSinglePassEncode(input: string, output: string, crf: number, watermark = false, lenient = false): Promise<void> {
   // Scale the longer dimension to 1080, preserving aspect ratio and
   // orientation instead of forcing everything into a fixed portrait
   // canvas — landscape videos get 1080 height, portrait get 1080 width.
   const scaleFilter = "scale='if(gt(iw,ih),-2,1080)':'if(gt(iw,ih),1080,-2)'";
 
   const args = [
-    "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
+    "-y",
+    "-fflags", lenient ? "+genpts+igndts+discardcorrupt" : "+genpts",
+    "-avoid_negative_ts", "make_zero",
+    ...(lenient ? ["-err_detect", "ignore_err"] : []),
+    "-i", input,
   ];
 
   if (watermark) {
@@ -408,6 +436,14 @@ async function startBullMqWorker() {
 
   worker.on("failed", (job, err) => {
     console.error(`Job ${job?.id} failed:`, err.message);
+    // Notify the app so the video's status flips from stuck-forever
+    // "Processing" to a real "failed" state the user can see and retry.
+    if (job?.data) {
+      const jobData = job.data as Job;
+      notifyAppOfCompletion(jobData.videoId, "rejected", {
+        moderationFlag: `Processing failed: ${err.message.slice(0, 200)}`,
+      }).catch((notifyErr) => console.error("Failed to notify app of job failure:", notifyErr));
+    }
   });
 
   worker.on("error", (err) => {

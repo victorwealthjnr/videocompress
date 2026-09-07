@@ -71,9 +71,8 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   if (sizeBytes > MAX_OUTPUT_BYTES) {
     console.log("Output exceeded cap — increasing compression slightly.");
     await runSinglePassEncode(localRaw, localOut, FALLBACK_CRF, needsWatermark);
+    sizeBytes = statSync(localOut).size;
   }
-
-  const sizeBytes = statSync(localOut).size;
 
   // Content moderation gate: grab a few frames from the final output
   // and check them before this video is ever made public. If flagged,

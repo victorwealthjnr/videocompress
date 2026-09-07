@@ -39,7 +39,7 @@ const BUCKET = process.env.R2_BUCKET!;
 // footage) producing an unreasonably large file.
 const DEFAULT_CRF = 23;
 const FALLBACK_CRF = 26; // used only if DEFAULT_CRF somehow overshoots the cap
-const MAX_OUTPUT_BYTES = 240 * 1024 * 1024; // matches your actual 240MB upload cap — heavy CRF compression never triggers for a normal upload; it's a pure safety net for the edge case of something slipping past app-level validation
+const MAX_OUTPUT_BYTES = 100 * 1024 * 1024;
 const AUDIO_KBPS = 96;
 
 type Job = { videoId: string; userId: string; rawKey: string; watermark?: boolean };
@@ -53,40 +53,24 @@ export async function processJob(job: Job): Promise<{ compressedKey: string; siz
   const rawSizeBytes = statSync(localRaw).size;
   const needsWatermark = job.watermark === true;
 
-  // PRIMARY OPERATION: fast remux to a clean, universally-playable MP4.
-  // This is what almost every upload needs — not size reduction, but
-  // compatibility. A phone/screen-recorder export might use a codec or
-  // container that doesn't play in every browser; remuxing (repackaging
-  // without re-encoding) fixes that in 1-3 seconds regardless of file
-  // size, with zero quality loss since no frame data is touched.
-  if (rawSizeBytes <= MAX_OUTPUT_BYTES && !needsWatermark) {
-    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB — fast remux for playback compatibility.`);
-    try {
-      await remuxOnly(localRaw, localOut);
-    } catch (err) {
-      // Rare: some source codec/container combos can't be stream-copied
-      // cleanly into mp4. Fall back to a real encode so the job still
-      // succeeds rather than failing outright.
-      console.log("Remux failed, falling back to full encode:", err);
-      await encodeWithFallback(localRaw, localOut, DEFAULT_CRF, needsWatermark);
-    }
-  } else {
-    // SECONDARY OPERATION, rare: only real files big enough to matter
-    // for someone's bandwidth cap (or a watermark request) go through
-    // the slower, heavier CRF compression path — not the default for
-    // most uploads.
-    console.log(`Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB${needsWatermark ? " (watermark required)" : ", over the compatibility threshold"} — running full compression.`);
-    await encodeWithFallback(localRaw, localOut, DEFAULT_CRF, needsWatermark);
+  // Always encode to H.264 1080p. Skipping encode for files under 100MB
+  // left iPhone HEVC / 4K / 20–80Mbps originals in place — Chrome, Framer,
+  // and slow networks then buffer or stutter. Remux-only is only a
+  // fallback if the encode itself fails.
+  console.log(
+    `Input is ${(rawSizeBytes / 1024 / 1024).toFixed(2)}MB${needsWatermark ? " (watermark required)" : ""} — encoding for streaming.`,
+  );
+  try {
+    await runSinglePassEncode(localRaw, localOut, DEFAULT_CRF, needsWatermark);
+  } catch (err) {
+    console.log("Encode failed, remuxing with faststart as fallback:", err);
+    await remuxOnly(localRaw, localOut);
+  }
 
-    let sizeBytes = statSync(localOut).size;
-
-    // If a genuinely long/complex video still overshoots the cap, one
-    // corrective pass at a slightly higher CRF (a bit more compression,
-    // not a crushing amount) rather than trying to hit an exact size.
-    if (sizeBytes > MAX_OUTPUT_BYTES) {
-      console.log("Output exceeded cap — increasing compression slightly.");
-      await encodeWithFallback(localRaw, localOut, FALLBACK_CRF, needsWatermark);
-    }
+  let sizeBytes = statSync(localOut).size;
+  if (sizeBytes > MAX_OUTPUT_BYTES) {
+    console.log("Output exceeded cap — increasing compression slightly.");
+    await runSinglePassEncode(localRaw, localOut, FALLBACK_CRF, needsWatermark);
   }
 
   const sizeBytes = statSync(localOut).size;
@@ -128,6 +112,7 @@ function remuxOnly(input: string, output: string): Promise<void> {
   const args = [
     "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
     "-c", "copy",
+    "-movflags", "+faststart",
     output,
   ];
   return runFfmpeg(args);
@@ -138,36 +123,14 @@ function remuxOnly(input: string, output: string): Promise<void> {
 // transparent background for a clean overlay look.
 const WATERMARK_PATH = "/app/logo.png";
 
-/**
- * Wraps the encode with one automatic retry using more error-tolerant
- * input flags if the first attempt crashes. Some source files have
- * malformed timestamps, corrupted frames, or unusual metadata that
- * cause ffmpeg to die mid-decode (signal-killed, not a clean error).
- * Rather than failing the whole job over a single quirky file, retry
- * once with flags that tell ffmpeg to tolerate and skip past errors
- * in the input instead of crashing on them.
- */
-async function encodeWithFallback(input: string, output: string, crf: number, watermark: boolean): Promise<void> {
-  try {
-    await runSinglePassEncode(input, output, crf, watermark);
-  } catch (err) {
-    console.log("Primary encode failed, retrying with error-tolerant flags:", err);
-    await runSinglePassEncode(input, output, crf, watermark, /* lenient */ true);
-  }
-}
-
-function runSinglePassEncode(input: string, output: string, crf: number, watermark = false, lenient = false): Promise<void> {
+function runSinglePassEncode(input: string, output: string, crf: number, watermark = false): Promise<void> {
   // Scale the longer dimension to 1080, preserving aspect ratio and
   // orientation instead of forcing everything into a fixed portrait
   // canvas — landscape videos get 1080 height, portrait get 1080 width.
   const scaleFilter = "scale='if(gt(iw,ih),-2,1080)':'if(gt(iw,ih),1080,-2)'";
 
   const args = [
-    "-y",
-    "-fflags", lenient ? "+genpts+igndts+discardcorrupt" : "+genpts",
-    "-avoid_negative_ts", "make_zero",
-    ...(lenient ? ["-err_detect", "ignore_err"] : []),
-    "-i", input,
+    "-y", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-i", input,
   ];
 
   if (watermark) {
@@ -189,8 +152,12 @@ function runSinglePassEncode(input: string, output: string, crf: number, waterma
     "-threads", "2",
     "-c:v", "libx264", "-crf", `${crf}`,
     "-preset", "fast", "-profile:v", "high", "-level", "4.1",
+    // Cap peak bitrate so a “high quality” CRF pass still streams on
+    // ~3–4 Mbps links instead of bursting to 8–20 Mbps.
+    "-maxrate", "3M", "-bufsize", "6M",
     "-g", "48", "-keyint_min", "48", "-sc_threshold", "0", // keyframe every ~2s for smooth seeking
     "-c:a", "aac", "-b:a", `${AUDIO_KBPS}k`,
+    "-movflags", "+faststart",
     output,
   );
 
@@ -436,14 +403,6 @@ async function startBullMqWorker() {
 
   worker.on("failed", (job, err) => {
     console.error(`Job ${job?.id} failed:`, err.message);
-    // Notify the app so the video's status flips from stuck-forever
-    // "Processing" to a real "failed" state the user can see and retry.
-    if (job?.data) {
-      const jobData = job.data as Job;
-      notifyAppOfCompletion(jobData.videoId, "rejected", {
-        moderationFlag: `Processing failed: ${err.message.slice(0, 200)}`,
-      }).catch((notifyErr) => console.error("Failed to notify app of job failure:", notifyErr));
-    }
   });
 
   worker.on("error", (err) => {
